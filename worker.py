@@ -109,23 +109,71 @@ async def _dispatch_engine(mod, gateway: str, url: str, card: Dict,
                             proxy_dict: Optional[Dict],
                             user_id: int = 0,
                             proxy_data: Optional[Dict] = None) -> Dict:
-    if gateway == "stripe":
-        # Prefer CsHitSession (works for cs_live_ checkout URLs, no pk required upfront)
-        if hasattr(mod, "CsHitSession"):
-            sess = mod.CsHitSession(url, proxy=_single_proxy_str(proxy_dict))
-            ok, err = await sess.open()
-            if not ok:
-                return {"success": False, "status": "ERROR", "error": err}
-            try:
-                return await sess.check_card(card)
-            finally:
-                await sess.close()
+        if gateway == "stripe":
+        import re as _re
 
-        # Fallback to StripeAPIHitter (invoice /i/ URLs) — now handles pk scraping itself
+        # Extract cs_live / pi_live / seti_live from whatever the user pasted
+        cs_id = None
+
+        # 1) Plain id present in URL
+        m = _re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", url)
+        if m:
+            cs_id = m.group(1)
+        else:
+            m = _re.search(r"(pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
+            if m:
+                cs_id = m.group(1)
+            else:
+                m = _re.search(r"(seti_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
+                if m:
+                    cs_id = m.group(1)
+
+        # 2) Decode fid fragment if no plain id found
+        pk_hint = None
+        if not cs_id:
+            try:
+                from gateways.stripe.stripe_fid import decode_fragment
+                frag = decode_fragment(url)
+                cs_id = frag.get("checkoutSessionId") or frag.get("client_secret")
+                pk_hint = frag.get("apiKey")
+            except Exception:
+                pass
+
+        if not cs_id:
+            return {
+                "success": False, "status": "ERROR",
+                "error": "Cannot extract cs_live/pi_live from URL",
+            }
+
+        # ── CsHitSession path (preferred — handles warmup + init) ──
+        if hasattr(mod, "CsHitSession"):
+            try:
+                sess = mod.CsHitSession(url, proxy=_single_proxy_str(proxy_dict))
+                ok, err = await sess.open()
+                if ok:
+                    try:
+                        return await sess.check_card(card)
+                    finally:
+                        await sess.close()
+                # if open() failed, fall through to StripeAPIHitter
+                # log the reason so we know why
+                import logging
+                logging.getLogger("gokuhitter").warning(
+                    f"CsHitSession.open failed: {err} — falling back to StripeAPIHitter"
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger("gokuhitter").warning(
+                    f"CsHitSession crashed: {e} — falling back"
+                )
+
+        # ── StripeAPIHitter path (invoice / direct PI / fallback) ──
         import engines.stripe_hitter as sh
         hitter = sh.StripeAPIHitter(
-            pk_live="", cs_live=url,
+            pk_live=pk_hint or "",
+            cs_live=cs_id,
             proxy_data=_proxy_data_dict(proxy_dict),
+            full_page_url=url,
         )
         return await hitter.hit(card, 1, user_id)
 
