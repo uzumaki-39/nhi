@@ -1,13 +1,21 @@
+"""
+worker.py — per-hit pipeline: BIN lookup, proxy selection, engine dispatch,
+3DS handoff, DB persistence.
+"""
 import time
 import importlib
 import asyncio
+import re
+import logging
 from typing import Dict, Optional, Any
+
 import config
 import db
 import proxies as proxy_mod
 from cards import brand_of
 from dispatcher import detect
 
+log = logging.getLogger("gokuhitter")
 
 USER_SEMS: Dict[int, asyncio.Semaphore] = {}
 GLOBAL_SEM = asyncio.Semaphore(config.GLOBAL_CONCURRENCY)
@@ -40,11 +48,40 @@ async def _lookup_bin(card: str) -> Dict[str, str]:
     return {"country": "", "bank": "", "brand": ""}
 
 
+def _extract_stripe_id(url: str) -> Optional[str]:
+    """Pull cs_live / pi_live / seti_live id from a URL or plain id string."""
+    if not url:
+        return None
+
+    m = re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", url)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(seti_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
+    if m:
+        return m.group(1)
+
+    # fid hash decode as last resort
+    try:
+        from gateways.stripe.stripe_fid import decode_fragment
+        frag = decode_fragment(url)
+        return frag.get("checkoutSessionId") or frag.get("client_secret")
+    except Exception:
+        pass
+
+    return None
+
+
 async def run_hit(user_id: int, url: str, card: Dict, gateway: Optional[str] = None) -> Dict[str, Any]:
     t0 = time.time()
 
     if gateway is None:
         gateway, _ = detect(url)
+
     if gateway == "unknown":
         return {
             "success": False, "status": "ERROR",
@@ -56,15 +93,19 @@ async def run_hit(user_id: int, url: str, card: Dict, gateway: Optional[str] = N
     proxy = await proxy_mod.pick_proxy(user_id, bin_info.get("country") or None)
     proxy_dict = proxy_mod.build_proxies_dict(proxy) if proxy else None
 
-    engine_mod_path = f"engines.{gateway if gateway != 'stripe' else 'stripe_hit_engine'}"
+    engine_mod_path = (
+        f"engines.{gateway if gateway != 'stripe' else 'stripe_hit_engine'}"
+    )
     try:
         mod = importlib.import_module(engine_mod_path)
     except ImportError:
-        mod = importlib.import_module("engines." + gateway + "_hitter")
+        mod = importlib.import_module(f"engines.{gateway}_hitter")
 
     async with GLOBAL_SEM, _user_sem(user_id):
         try:
-            result = await _dispatch_engine(mod, gateway, url, card, proxy_dict, user_id, proxy)
+            result = await _dispatch_engine(
+                mod, gateway, url, card, proxy_dict, user_id, proxy,
+            )
         except Exception as ex:
             result = {
                 "success": False, "status": "ERROR",
@@ -109,43 +150,24 @@ async def _dispatch_engine(mod, gateway: str, url: str, card: Dict,
                             proxy_dict: Optional[Dict],
                             user_id: int = 0,
                             proxy_data: Optional[Dict] = None) -> Dict:
-        if gateway == "stripe":
-        import re as _re
-
-        # Extract cs_live / pi_live / seti_live from whatever the user pasted
-        cs_id = None
-
-        # 1) Plain id present in URL
-        m = _re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", url)
-        if m:
-            cs_id = m.group(1)
-        else:
-            m = _re.search(r"(pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
-            if m:
-                cs_id = m.group(1)
-            else:
-                m = _re.search(r"(seti_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", url)
-                if m:
-                    cs_id = m.group(1)
-
-        # 2) Decode fid fragment if no plain id found
-        pk_hint = None
+    if gateway == "stripe":
+        cs_id = _extract_stripe_id(url)
         if not cs_id:
+            return {
+                "success": False, "status": "ERROR",
+                "error": "Cannot extract cs_live / pi_live from URL",
+            }
+
+        pk_hint = None
+        if "#" in url:
             try:
                 from gateways.stripe.stripe_fid import decode_fragment
                 frag = decode_fragment(url)
-                cs_id = frag.get("checkoutSessionId") or frag.get("client_secret")
                 pk_hint = frag.get("apiKey")
             except Exception:
                 pass
 
-        if not cs_id:
-            return {
-                "success": False, "status": "ERROR",
-                "error": "Cannot extract cs_live/pi_live from URL",
-            }
-
-        # ── CsHitSession path (preferred — handles warmup + init) ──
+        # Preferred: CsHitSession (handles warmup + init)
         if hasattr(mod, "CsHitSession"):
             try:
                 sess = mod.CsHitSession(url, proxy=_single_proxy_str(proxy_dict))
@@ -155,19 +177,11 @@ async def _dispatch_engine(mod, gateway: str, url: str, card: Dict,
                         return await sess.check_card(card)
                     finally:
                         await sess.close()
-                # if open() failed, fall through to StripeAPIHitter
-                # log the reason so we know why
-                import logging
-                logging.getLogger("gokuhitter").warning(
-                    f"CsHitSession.open failed: {err} — falling back to StripeAPIHitter"
-                )
+                log.warning(f"CsHitSession.open failed: {err} — falling back")
             except Exception as e:
-                import logging
-                logging.getLogger("gokuhitter").warning(
-                    f"CsHitSession crashed: {e} — falling back"
-                )
+                log.warning(f"CsHitSession crashed: {e} — falling back")
 
-        # ── StripeAPIHitter path (invoice / direct PI / fallback) ──
+        # Fallback: StripeAPIHitter (invoice / direct PI)
         import engines.stripe_hitter as sh
         hitter = sh.StripeAPIHitter(
             pk_live=pk_hint or "",
@@ -222,7 +236,6 @@ def _proxy_data_dict(proxy_dict: Optional[Dict]) -> Optional[Dict]:
 
 
 async def run_jio(user_id: int, phone: str, amount: float, card: Dict) -> Dict[str, Any]:
-    import importlib
     mod = importlib.import_module("engines.jio_hitter")
     proxy = await proxy_mod.pick_proxy(user_id, "IN")
     proxy_dict = proxy_mod.build_proxies_dict(proxy) if proxy else None
