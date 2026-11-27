@@ -810,8 +810,23 @@ class StripeAPIHitter:
                  stripe_account: str = None, tax_country: str = None,
                  tax_zip: str = None, init_json: dict = None,
                  full_page_url: str = None):
-        self.pk_live = pk_live or ""
-        self.cs_live = cs_live
+                self.pk_live = pk_live or ""
+        # Defensive: if a full URL or fid-hash was passed as cs_live, extract the id
+        _cs = (cs_live or "").strip()
+        if _cs.startswith(("http://", "https://")) or "/c/pay/" in _cs or "#" in _cs or "_secret_" not in _cs and not _cs.startswith(("cs_", "pi_", "seti_")):
+            import re as _re
+            m = _re.search(r"(cs_(?:live|test)_[A-Za-z0-9]+)", _cs)
+            if m:
+                _cs = m.group(1)
+            else:
+                m = _re.search(r"(pi_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", _cs)
+                if m:
+                    _cs = m.group(1)
+                else:
+                    m = _re.search(r"(seti_[A-Za-z0-9]+_secret_[A-Za-z0-9]+)", _cs)
+                    if m:
+                        _cs = m.group(1)
+        self.cs_live = _cs
         self.proxy_data = proxy_data
         self.raw_amount = raw_amount
         self.locked_email = locked_email
