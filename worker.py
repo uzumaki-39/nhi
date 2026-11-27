@@ -65,7 +65,6 @@ def _extract_stripe_id(url: str) -> Optional[str]:
     if m:
         return m.group(1)
 
-    # fid hash decode as last resort
     try:
         from gateways.stripe.stripe_fid import decode_fragment
         frag = decode_fragment(url)
@@ -167,7 +166,6 @@ async def _dispatch_engine(mod, gateway: str, url: str, card: Dict,
             except Exception:
                 pass
 
-        # Preferred: CsHitSession (handles warmup + init)
         if hasattr(mod, "CsHitSession"):
             try:
                 sess = mod.CsHitSession(url, proxy=_single_proxy_str(proxy_dict))
@@ -181,7 +179,6 @@ async def _dispatch_engine(mod, gateway: str, url: str, card: Dict,
             except Exception as e:
                 log.warning(f"CsHitSession crashed: {e} — falling back")
 
-        # Fallback: StripeAPIHitter (invoice / direct PI)
         import engines.stripe_hitter as sh
         hitter = sh.StripeAPIHitter(
             pk_live=pk_hint or "",
